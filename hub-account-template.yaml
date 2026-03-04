@@ -1,0 +1,554 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Hub Account - EC2 Instance Type Change Tracking'
+
+Metadata:
+  cfn_nag:
+    rules_to_suppress:
+      - id: W89
+        reason: "Lambda functions access AWS managed services only (DynamoDB, EC2 API, SES, Marketplace). VPC deployment not required and would add unnecessary complexity and NAT Gateway costs."
+      - id: W11
+        reason: "Wildcard resources required for AWS APIs that don't support resource-level permissions (ec2:DescribeInstances, ec2:DescribeImages, aws-marketplace:SearchAgreements, organizations:DescribeOrganization). These are read-only operations following AWS best practices."
+      - id: W28
+        reason: "Explicit resource names improve operational clarity and are intentional for this solution. Stack replacement scenarios are acceptable."
+  checkov:
+    skip:
+      - id: CKV_AWS_117
+        comment: "Lambda functions only access AWS managed services. VPC deployment not required."
+      - id: CKV_AWS_111
+        comment: "Wildcard resources required for AWS APIs without resource-level permission support."
+      - id: CKV_AWS_173
+        comment: "Lambda environment variables don't contain sensitive data. All secrets should be in AWS Secrets Manager if needed."
+
+Parameters:
+  EmailFrom:
+    Type: String
+    Description: 'Email address to send notifications from (must be verified in SES)'
+    Default: ''
+  
+  EmailRecipient:
+    Type: String
+    Description: 'Email address to receive notifications'
+    Default: ''
+  
+  EnableEmailNotifications:
+    Type: String
+    Description: 'Enable email notifications for instance type changes'
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+  
+  SkipAgreementVerification:
+    Type: String
+    Description: 'Skip agreement verification (always consider instance types valid)'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Resources:
+  # KMS Key for encryption
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for EC2 monitoring solution encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudTrail to encrypt logs
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - 'kms:GenerateDataKey*'
+              - 'kms:DecryptDataKey'
+            Resource: '*'
+            Condition:
+              StringLike:
+                'kms:EncryptionContext:aws:cloudtrail:arn':
+                  - !Sub 'arn:aws:cloudtrail:*:${AWS::AccountId}:trail/*'
+          - Sid: Allow CloudTrail to describe key
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 'kms:DescribeKey'
+            Resource: '*'
+          - Sid: Allow DynamoDB to use the key
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+              - 'kms:CreateGrant'
+            Resource: '*'
+          - Sid: Allow Lambda to use the key
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+            Resource: '*'
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-encryption'
+      TargetKeyId: !Ref EncryptionKey
+
+  # S3 Bucket for Access Logs
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "This is the logging destination bucket. Enabling access logging on it would create a circular dependency."
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "This is the logging destination bucket. Cannot enable access logging on itself to avoid circular dependency."
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-logs-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${LoggingBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # Dead Letter Queue for OrgLookup Lambda
+  OrgLookupDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-OrgLookup-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  # Lambda Role for Organization ID Lookup
+  OrgLookupRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "organizations:DescribeOrganization does not support resource-level permissions. Wildcard is required per AWS API design."
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DescribeOrganization
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: organizations:DescribeOrganization
+                Resource: '*'
+        - PolicyName: DLQAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt OrgLookupDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt EncryptionKey.Arn
+
+  # Lambda Function to get Organization ID
+  OrgLookupFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda only calls organizations:DescribeOrganization API. No VPC resources accessed. VPC deployment would add unnecessary NAT Gateway costs."
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Lambda only accesses AWS Organizations API (managed service). VPC deployment not required."
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-OrgLookup'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt OrgLookupRole.Arn
+      Timeout: 30
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt OrgLookupDLQ.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import traceback
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Get Organization ID
+                  org_client = boto3.client('organizations')
+                  response = org_client.describe_organization()
+                  org_id = response['Organization']['Id']
+                  
+                  response_data = {'OrganizationId': org_id}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  traceback.print_exc()
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(e))
+
+  # Custom Resource to invoke the lookup
+  OrganizationId:
+    Type: Custom::OrganizationId
+    Properties:
+      ServiceToken: !GetAtt OrgLookupFunction.Arn
+
+  # DynamoDB Table for instance states and changes
+  InstanceTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit table name improves operational clarity and is intentional for this solution."
+    Properties:
+      TableName: !Sub '${AWS::StackName}-Instances'
+      AttributeDefinitions:
+        - AttributeName: instanceId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: instanceId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # S3 Bucket for CloudTrail
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-trail-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: cloudtrail-logs/
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # S3 Bucket Policy
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CloudTrailBucket.Arn
+              - !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # CloudTrail
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub '${AWS::StackName}-Trail'
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      KMSKeyId: !Ref EncryptionKey
+      EventSelectors:
+        - ReadWriteType: WriteOnly
+          IncludeManagementEvents: true
+
+  # Custom Event Bus for cross-account
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${AWS::StackName}-Bus'
+
+  # Event Bus Policy - Allows spoke accounts within the same organization
+  EventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: !Ref EventBus
+      StatementId: AllowSpokeAccounts
+      Statement:
+        Effect: Allow
+        Principal: '*'
+        Action: events:PutEvents
+        Resource: !GetAtt EventBus.Arn
+        Condition:
+          StringEquals:
+            aws:PrincipalOrgID: !GetAtt OrganizationId.OrganizationId
+
+  # Lambda Role
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Wildcard required for EC2 describe operations (DescribeInstances, DescribeImages) and Marketplace APIs (SearchAgreements, GetAgreementTerms) which don't support resource-level permissions per AWS API design."
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: "Wildcard resources required for read-only AWS APIs that don't support resource-level permissions (EC2 describe, Marketplace search)."
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2AndDynamoDB
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceAttribute
+                  - ec2:DescribeImages
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt InstanceTable.Arn
+              - Effect: Allow
+                Action:
+                  - aws-marketplace:SearchAgreements
+                  - aws-marketplace:GetAgreementTerms
+                  - aws-marketplace:DescribeEntity
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LambdaDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt EncryptionKey.Arn
+
+  # Dead Letter Queue for Lambda
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  # Lambda Function
+  TrackFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda accesses AWS managed services only (DynamoDB, EC2 API, SES, Marketplace API). No VPC resources. VPC deployment would add NAT Gateway costs without security benefit."
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Lambda only accesses AWS managed services. VPC deployment not required."
+          - id: CKV_AWS_173
+            comment: "Environment variables contain only resource names and configuration, no sensitive data. Secrets should use AWS Secrets Manager if needed."
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-Track'
+      Runtime: python3.9
+      Handler: lambda_function.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      Environment:
+        Variables:
+          TABLE: !Ref InstanceTable
+          EMAIL_FROM: !Ref EmailFrom
+          EMAIL_RECIPIENT: !Ref EmailRecipient
+          ENABLE_EMAIL_NOTIFICATIONS: !Ref EnableEmailNotifications
+          SKIP_AGREEMENT_VERIFICATION: !Ref SkipAgreementVerification
+          EMAIL_SUBJECT_TEMPLATE: 'AWS Marketplace Instance Type Change: {instance_id}'
+          EMAIL_BODY_TEMPLATE: |
+            Instance Type Change Detected. Please amend your AWS agreement {agreement_id} for {product_name} to avoid extra charges from On-Demand usage. Visit the link below to update your agreement:
+            https://us-east-1.console.aws.amazon.com/marketplace/search/listing/prodview-hmnfufvl5o4ji/procurement/modify/?productId={product_id}&offerId={offer_id}&agreementId={agreement_id}
+            
+            Instance ID: {instance_id}
+            Product: {product_name}
+            Agreement: {agreement_id}
+            
+            Change Details:
+            - Before: {before_type}
+            - After: {after_type}
+            - Changed At: {changed_at}
+            
+            This is an automated notification from the EC2 Marketplace Monitoring System.
+      Code:
+        ZipFile: |
+          # Placeholder - Lambda code is deployed separately via AWS CLI
+          # Deploy using: aws lambda update-function-code --function-name ec2-monitoring-hub-Track --zip-file fileb://<(zip -q - lambda_function.py)
+          def handler(event, context):
+              return {'statusCode': 200, 'body': 'Placeholder - deploy actual code via CLI'}
+
+  # EventBridge Rules
+  StateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-StateChange'
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [EC2 Instance State-change Notification]
+        detail:
+          state: [stopping, stopped]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TrackFunction.Arn
+          Id: Lambda
+
+  ModifyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-Modify'
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventName: [ModifyInstanceAttribute]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TrackFunction.Arn
+          Id: Lambda
+
+  # Lambda Permissions
+  PermissionStateChange:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TrackFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StateChangeRule.Arn
+
+  PermissionModify:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TrackFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ModifyRule.Arn
+
+Outputs:
+  OrganizationId:
+    Description: 'Auto-detected AWS Organization ID'
+    Value: !GetAtt OrganizationId.OrganizationId
+  EventBusName:
+    Value: !Ref EventBus
+  EventBusArn:
+    Value: !GetAtt EventBus.Arn
+  TableName:
+    Value: !Ref InstanceTable
+  TrailName:
+    Value: !Ref Trail
