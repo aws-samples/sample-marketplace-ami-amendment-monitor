@@ -49,10 +49,11 @@ This solution monitors EC2 instance type changes for AWS Marketplace subscriptio
 
 ## Prerequisites
 
-- AWS Organization (required - solution only works within the same organization)
-- AWS CLI configured with appropriate credentials
-- CloudFormation permissions in hub and spoke accounts
-- SES verified email addresses (if using email notifications)
+- An active AWS account with appropriate permissions to create and manage AWS Lambda functions, Amazon EventBridge rules, and AWS Identity and Access Management (IAM) roles
+- AWS Organization enabled; solution only works within the same organization
+- An existing AWS Marketplace AMI subscription with an annual contract that you want to automate amendments for
+- Basic familiarity with AWS services including AWS Lambda, Amazon EventBridge, and Amazon EC2
+- AWS Command Line Interface (AWS CLI) installed and configured (optional, but helpful for testing)
 
 ## Deployment
 
@@ -73,7 +74,7 @@ aws cloudformation deploy \
 
 **Parameters:**
 - `EmailFrom`: SES verified sender email address
-- `EmailRecipient`: Email address to receive alerts
+- `EmailRecipient`: Email address(es) to receive notifications (comma-separated for multiple)
 - `EnableEmailNotifications`: Set to `true` to enable email alerts
 - `SkipAgreementVerification`: Set to `true` to receive alerts for ALL instance type changes on marketplace instances, without validating whether the old type was covered by your agreement"
 
