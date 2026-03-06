@@ -1,6 +1,6 @@
 # AWS Marketplace EC2 Instance Type Change Monitor
 
-![Architecture Diagram](AWS%20Marketplace_v5.drawio.png)
+![Architecture Diagram](AWS_Marketplace_monitorami_diagram.png)
 
 ## Overview
 
