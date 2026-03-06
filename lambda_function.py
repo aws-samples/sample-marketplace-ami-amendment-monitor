@@ -87,9 +87,9 @@ def send_email_notification(item):
         return
     
     email_from = os.environ.get('EMAIL_FROM', '')
-    email_recipient = os.environ.get('EMAIL_RECIPIENT', '')
+    email_recipients = [e.strip() for e in os.environ.get('EMAIL_RECIPIENT', '').split(',') if e.strip()]
     
-    if not email_from or not email_recipient:
+    if not email_from or not email_recipients:
         print("Email addresses not configured, skipping notification")
         return
     
@@ -121,7 +121,7 @@ def send_email_notification(item):
         # Send email
         response = ses.send_email(
             Source=email_from,
-            Destination={'ToAddresses': [email_recipient]},
+            Destination={'ToAddresses': email_recipients},
             Message={
                 'Subject': {'Data': subject},
                 'Body': {'Text': {'Data': body}}

@@ -27,7 +27,7 @@ Parameters:
   
   EmailRecipient:
     Type: String
-    Description: 'Email address to receive notifications'
+    Description: 'Email address(es) to receive notifications (comma-separated for multiple)'
     Default: ''
   
   EnableEmailNotifications:
