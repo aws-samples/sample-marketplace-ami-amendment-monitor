@@ -405,6 +405,7 @@ Resources:
                   - ec2:DescribeInstances
                   - ec2:DescribeInstanceAttribute
                   - ec2:DescribeImages
+                  - ec2:DescribeSnapshots
                 Resource: '*'
               - Effect: Allow
                 Action:

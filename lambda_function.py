@@ -302,9 +302,77 @@ def get_marketplace_agreement(product_code):
         print("An unexpected error occurred getting marketplace agreement — see CloudWatch logs for details")
         return None
 
+def _check_ami_marketplace(ami_id):
+    """
+    Check if an AMI is from marketplace by walking the ancestry chain.
+    Returns True if any AMI in the chain is marketplace-owned or has marketplace product codes.
+    """
+    visited = set()
+    current_ami = ami_id
+
+    for _ in range(5):  # max ancestry depth
+        if current_ami in visited:
+            break
+        visited.add(current_ami)
+
+        try:
+            imgs = ec2.describe_images(ImageIds=[current_ami])
+            if not imgs['Images']:
+                break
+            img = imgs['Images'][0]
+        except Exception:
+            break
+
+        # Check if this AMI has marketplace product codes
+        for pc in img.get('ProductCodes', []):
+            if pc.get('ProductCodeType') == 'marketplace':
+                print(f"✓ AMI {current_ami} has marketplace product code: {pc['ProductCodeId']}")
+                return True
+
+        # Check if this AMI is owned by aws-marketplace
+        try:
+            mp = ec2.describe_images(ImageIds=[current_ami], Owners=['aws-marketplace'])
+            if mp['Images']:
+                print(f"✓ AMI {current_ami} is owned by aws-marketplace")
+                return True
+        except Exception:
+            pass
+
+        # Look for source AMI in description (e.g. "Copied from ami-xxxxx")
+        source = re.search(r'ami-[0-9a-f]{8,17}', img.get('Description', ''))
+        if source and source.group() != current_ami:
+            current_ami = source.group()
+            continue
+
+        # Look for source AMI in snapshot descriptions
+        found_next = False
+        for bdm in img.get('BlockDeviceMappings', []):
+            snap_id = bdm.get('Ebs', {}).get('SnapshotId')
+            if snap_id:
+                try:
+                    snaps = ec2.describe_snapshots(SnapshotIds=[snap_id])
+                    for s in snaps.get('Snapshots', []):
+                        m = re.search(r'ami-[0-9a-f]{8,17}', s.get('Description', ''))
+                        if m and m.group() != current_ami:
+                            current_ami = m.group()
+                            found_next = True
+                            break
+                except Exception:
+                    pass
+            if found_next:
+                break
+
+        if not found_next:
+            break
+
+    return False
+
+
 def is_marketplace_instance(instance_id):
     """
     Check if instance is from marketplace AMI and not excluded by tag.
+    Uses multiple detection methods: instance product codes, AMI product codes,
+    marketplace owner filter, and AMI ancestry walk.
     Returns: (is_marketplace, instance) - tuple because we need both the boolean AND instance data
     """
     try:
@@ -319,17 +387,20 @@ def is_marketplace_instance(instance_id):
         if is_excluded_by_tag(instance):
             print("Excluded by tag")
             return False, None
-            
-        # Check if instance has marketplace product codes
-        product_codes = instance.get('ProductCodes', [])
-        if not product_codes:
-            return False, None
-            
-        if product_codes[0].get('ProductCodeType') != 'marketplace':
-            return False, None
 
-        print(f"✓ Marketplace instance: {instance_id}")
-        return True, instance
+        # Method 1: Check instance product codes (fastest)
+        for pc in instance.get('ProductCodes', []):
+            if pc.get('ProductCodeType') == 'marketplace':
+                print(f"✓ Marketplace instance (instance product code): {instance_id}")
+                return True, instance
+
+        # Method 2: Check AMI and ancestry chain
+        ami_id = instance.get('ImageId')
+        if ami_id and _check_ami_marketplace(ami_id):
+            print(f"✓ Marketplace instance (AMI detection): {instance_id}")
+            return True, instance
+
+        return False, None
         
     except ClientError as e:
         error_code = e.response['Error']['Code']
