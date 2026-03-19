@@ -1,0 +1,31 @@
+name: Package Lambda
+
+on:
+  push:
+    paths:
+      - 'lambda_function.py'
+    branches:
+      - main
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package lambda
+        run: zip lambda_function.py.zip lambda_function.py
+
+      - name: Commit zip
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add lambda_function.py.zip
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: update lambda_function.py.zip"
+            git push
+          fi
