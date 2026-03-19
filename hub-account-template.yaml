@@ -488,10 +488,135 @@ Resources:
             This is an automated notification from the EC2 Marketplace Monitoring System.
       Code:
         ZipFile: |
-          # Placeholder - Lambda code is deployed separately via AWS CLI
-          # Deploy using: aws lambda update-function-code --function-name ec2-monitoring-hub-Track --zip-file fileb://<(zip -q - lambda_function.py)
+          # Placeholder - actual code is deployed automatically by CodeDeployer custom resource
           def handler(event, context):
-              return {'statusCode': 200, 'body': 'Placeholder - deploy actual code via CLI'}
+              return {'statusCode': 200, 'body': 'Placeholder - code will be deployed automatically'}
+
+  # Dead Letter Queue for CodeDeployer Lambda
+  CodeDeployerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-CodeDeployer-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  # IAM Role for CodeDeployer Lambda
+  CodeDeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: UpdateLambdaCode
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                  - lambda:PublishVersion
+                Resource: !GetAtt TrackFunction.Arn
+        - PolicyName: DLQAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt CodeDeployerDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt EncryptionKey.Arn
+
+  # Lambda Function to download and deploy code from GitHub
+  CodeDeployerFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda needs internet access to download code from GitHub. VPC deployment would require NAT Gateway."
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Lambda needs internet access to reach GitHub. VPC deployment not required."
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-CodeDeployer'
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt CodeDeployerRole.Arn
+      Timeout: 60
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt CodeDeployerDLQ.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import traceback
+          from urllib.request import urlopen, Request
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  props = event['ResourceProperties']
+                  function_name = props['FunctionName']
+                  zip_url = props['ZipUrl']
+                  
+                  print(f"Downloading code from: {zip_url}")
+                  req = Request(zip_url, headers={'User-Agent': 'CloudFormation-CodeDeployer'})
+                  response = urlopen(req, timeout=30)
+                  zip_bytes = response.read()
+                  print(f"Downloaded {len(zip_bytes)} bytes")
+                  
+                  lambda_client = boto3.client('lambda')
+                  
+                  # Publish a version of the current code before updating (for rollback)
+                  try:
+                      ver = lambda_client.publish_version(
+                          FunctionName=function_name,
+                          Description='Pre-deploy snapshot'
+                      )
+                      print(f"Published version {ver['Version']} as rollback point")
+                  except Exception as e:
+                      print(f"Warning: Could not publish version: {e}")
+                  
+                  # Update function code
+                  result = lambda_client.update_function_code(
+                      FunctionName=function_name,
+                      ZipFile=zip_bytes
+                  )
+                  
+                  print(f"Code deployed successfully. CodeSha256: {result['CodeSha256']}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'CodeSha256': result['CodeSha256']
+                  })
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  traceback.print_exc()
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(e))
+
+  # Custom Resource to deploy Lambda code from GitHub
+  DeployTrackFunctionCode:
+    Type: Custom::DeployCode
+    DependsOn: TrackFunction
+    Properties:
+      ServiceToken: !GetAtt CodeDeployerFunction.Arn
+      FunctionName: !Ref TrackFunction
+      ZipUrl: 'https://github.com/aws-samples/sample-marketplace-ami-amendment-monitor/raw/main/lambda_function.py.zip'
+      # Change this value to force a re-download on stack update
+      DeployVersion: '1'
 
   # EventBridge Rules
   StateChangeRule:

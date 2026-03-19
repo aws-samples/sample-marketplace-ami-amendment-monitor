@@ -15,7 +15,8 @@ Parameters:
   
   HubEventBusName:
     Type: String
-    Description: 'Hub event bus name'
+    Description: 'Hub event bus name (must match exactly, case-sensitive)'
+    Default: 'ec2-monitoring-hub-Bus'
   
   HubRegion:
     Type: String

@@ -80,7 +80,7 @@ aws cloudformation deploy \
 
 **Note:** The stack automatically detects your AWS Organization ID and configures the EventBus to only accept events from accounts within your organization.
 
-**After deployment, note the outputs:**
+**Optional: After deployment, note the outputs:**
 ```bash
 aws cloudformation describe-stacks \
   --stack-name ec2-monitoring-hub \
@@ -90,24 +90,7 @@ aws cloudformation describe-stacks \
 
 You'll see the auto-detected `OrganizationId` and the `EventBusArn` needed for spoke account deployments.
 
-### Step 2: Deploy Lambda Function
-
-The Lambda function code is too large for inline CloudFormation deployment and must be deployed separately:
-
-```bash
-# Navigate to the directory containing lambda_function.py
-cd /path/to/your/project
-
-# Deploy the Lambda function code
-aws lambda update-function-code \
-  --function-name ec2-monitoring-hub-Track \
-  --zip-file fileb://<(zip -q - lambda_function.py) \
-  --region us-east-1
-```
-
-**Note:** You must deploy the Lambda code after every CloudFormation stack update, as stack updates reset the function code to a placeholder.
-
-### Step 3: Deploy Spoke Account Stack
+### Step 2: Deploy Spoke Account Stack
 
 If monitoring instances in different accounts, deploy this stack in each spoke account. If the spoke and hub accounts are the same, deploy this CloudFormation stack in the same linked account.
 
@@ -118,12 +101,13 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_IAM \
   --parameter-overrides \
     HubAccountId="YOUR_HUB_ACCOUNT_ID" \
-    HubEventBusName="ec2-monitoring-hub-Bus" \
     HubRegion="us-east-1" \
   --region us-east-1
 ```
 
-### Step 4: Verify SES Email Addresses (If Using Email Notifications)
+**Note:** The `HubEventBusName` parameter defaults to `ec2-monitoring-hub-Bus` (matching the default hub stack name). If you used a custom hub stack name, set `HubEventBusName` to `<your-hub-stack-name>-Bus`. This value is case-sensitive — a mismatch will silently prevent events from reaching the hub.
+
+### Step 3: Verify SES Email Addresses (If Using Email Notifications)
 
 ```bash
 # Verify sender email
@@ -143,6 +127,8 @@ Check your email and click the verification links sent by AWS.
 2. **Stop the instance** (state captured immediately)
 3. **Change the instance type** via AWS Console or CLI
 4. **Check your email** for the alert (if notifications enabled)
+
+**Note:** It has to be an AMI from AWS Marketplace that is subject to annually subscriptions. Refer to this [link](https://aws.amazon.com/marketplace/help/buyer-annual-subscription) for more information.
 
 ### Verify DynamoDB Records
 
@@ -193,36 +179,6 @@ aws logs describe-log-streams \
   --region us-east-1
 ```
 
-## DynamoDB Record Structure
-
-### State Capture (When Instance Stops)
-```json
-{
-  "instanceId": "i-1234567890abcdef0",
-  "beforeInstanceType": "m5.large",
-  "capturedAt": "2026-01-21T12:00:00Z",
-  "ttl": 1745328000
-}
-```
-
-### Change Record (When Instance Type Modified)
-```json
-{
-  "instanceId": "i-1234567890abcdef0",
-  "beforeInstanceType": "m5.large",
-  "afterInstanceType": "m5.xlarge",
-  "capturedAt": "2026-01-21T12:00:00Z",
-  "changedAt": "2026-01-21T12:15:00Z",
-  "agreementId": "agmt-1234567890abcdef0",
-  "agreementName": "PurchaseAgreement",
-  "productName": "SUSE Linux Enterprise Server for SAP Applications 15 SP6",
-  "productId": "prod-1234567890abc",
-  "offerId": "offer-1234567890abc",
-  "isTriggeredTheAlert": true,
-  "ttl": 1745328000
-}
-```
-
 ## Configuration Options
 
 ### Exclude Specific Instances from Monitoring
@@ -247,12 +203,6 @@ aws cloudformation update-stack \
     ParameterKey=EmailRecipient,UsePreviousValue=true \
     ParameterKey=EnableEmailNotifications,UsePreviousValue=true \
     ParameterKey=SkipAgreementVerification,ParameterValue=true \
-  --region us-east-1
-
-# Redeploy Lambda code after stack update
-aws lambda update-function-code \
-  --function-name ec2-monitoring-hub-Track \
-  --zip-file fileb://<(zip -q - lambda_function.py) \
   --region us-east-1
 ```
 
@@ -306,7 +256,7 @@ aws logs filter-log-events \
 
 ### Instance Not Being Monitored
 
-1. Verify instance is from AWS Marketplace (has ProductCode)
+1. Verify instance is from AWS Marketplace (has ProductCode or is launched from a marketplace AMI)
 2. Check for exclusion tag: `aws-marketplace-monitor=false`
 3. Verify instance has an active marketplace agreement
 4. Check Lambda logs for processing details
